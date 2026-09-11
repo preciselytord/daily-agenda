@@ -13,12 +13,17 @@ Input markdown shape (as produced by the routine):
     ## Pull requests
     ## Issues
 
-Usage: agenda_pdf.py AGENDA.md OUT.pdf
+Usage: agenda_pdf.py AGENDA.md OUT.pdf [auto|focus|compact|classic]
+
+Layouts: "focus" (meeting rows, focus box, lined notes) for days with up to
+three timed meetings, "compact" (adaptive hour grid) for busier days, "classic"
+(fixed 07-19 grid). "auto" picks focus or compact; AGENDA_LAYOUT overrides.
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import os
 import re
 import sys
 from pathlib import Path
@@ -155,7 +160,82 @@ def dot_grid(c: canvas.Canvas, x0: float, y0: float, x1: float, y1: float, step:
 
 # ---------------------------------------------------------------- page
 
-def render(md: str, out: Path) -> None:
+def draw_header(c, date):
+    top = PAGE_H - MARGIN
+    c.setFillColor(INK)
+    c.setFont(BOLD, 26)
+    c.drawString(MARGIN, top - 22, date.strftime("%A").upper())
+    c.setFont(FONT, 11)
+    c.setFillColor(GREY)
+    c.drawString(MARGIN, top - 36, date.strftime("%-d %B %Y"))
+    c.setFont(FONT, 8.5)
+    right = PAGE_W - MARGIN
+    c.drawRightString(right, top - 10, "DAILY AGENDA")
+    c.drawRightString(right, top - 22, f"Week {date.isocalendar()[1]}  ·  Day {date.timetuple().tm_yday}")
+    monday = date - dt.timedelta(days=date.weekday())
+    sx = right - 7 * 13
+    for i in range(7):
+        d = monday + dt.timedelta(days=i)
+        cx = sx + i * 13 + 6
+        cy = top - 36
+        if d == date:
+            c.setFillColor(INK)
+            c.circle(cx, cy, 5.2, stroke=0, fill=1)
+            c.setFillColor(white)
+        else:
+            c.setFillColor(GREY)
+        c.setFont(BOLD if d == date else FONT, 6.5)
+        c.drawCentredString(cx, cy - 2.3, "MTWTFSS"[i])
+    c.setStrokeColor(INK)
+    c.setLineWidth(1.2)
+    c.line(MARGIN, top - 46, right, top - 46)
+    return top - 60
+
+
+def draw_lists(c, sections, x, y, w, bottom, size=7.2, two_col=False):
+    """Right-hand checklists. Returns final y."""
+    def draw_col(x, y, w):
+        for key in SECTION_ORDER:
+            items = sections.get(key, []) or ["nothing pending"]
+            y = section_heading(c, x, y, w, SECTION_TITLES[key])
+            for it in items:
+                placeholder = any(k in it.lower() for k in ("nothing pending", "not connected", "not accessible", "not authorized"))
+                lines = wrap(it, FONT, size, w - 13)
+                needed = (size + 2) * len(lines) + 2
+                if y - needed < bottom + 4:
+                    c.setFillColor(GREY); c.setFont(FONT, 6.5); c.drawString(x + 13, y - 6, "…"); y -= 10
+                    break
+                if placeholder:
+                    c.setFillColor(GREY); c.setFont(FONT, size); c.drawString(x + 13, y - 6, lines[0])
+                    y -= needed + 1
+                    continue
+                checkbox(c, x + 1, y - 7.2)
+                c.setFillColor(INK); c.setFont(FONT, size)
+                for i, ln in enumerate(lines):
+                    c.drawString(x + 13, y - 6 - i * (size + 2), ln)
+                y -= needed + 1
+            y -= 9
+            if y < bottom + 30:
+                break
+        return y
+    return draw_col(x, y, w)
+
+
+def lined_area(c, x0, y0, x1, y1, step=14.0):
+    c.setStrokeColor(FAINT); c.setLineWidth(0.5)
+    y = y1
+    while y >= y0:
+        c.line(x0, y, x1, y); y -= step
+
+
+def render(md: str, out: Path, layout: str = "auto") -> None:
+    if layout == "auto":
+        timed, _ = parse_meetings(parse(md)["sections"].get("Meetings", []))
+        layout = "focus" if len(timed) <= 3 else "compact"
+    if layout == "focus":
+        return render_focus(md, out)
+    if layout == "compact":
+        return render_compact(md, out)
     data = parse(md)
     date = parse_date(data["title"]) or dt.date.today()
     sections = data["sections"]
@@ -336,10 +416,128 @@ def render(md: str, out: Path) -> None:
     c.save()
 
 
+def _meeting_rows(c, timed, allday, x, y, w):
+    """Meeting list rows: bold time + title. Returns y."""
+    rows = [("All day", a) for a in allday] + [(m["label"], m["text"]) for m in timed]
+    if not rows:
+        c.setFillColor(GREY); c.setFont(FONT, 7.5); c.drawString(x + 2, y - 8, "no meetings"); return y - 16
+    for label, text in rows:
+        c.setFillColor(FILL); c.roundRect(x, y - 15, w, 15, 2, stroke=0, fill=1)
+        c.setFillColor(INK); c.rect(x, y - 15, 2.2, 15, stroke=0, fill=1)
+        c.setFont(BOLD, 7.5); c.drawString(x + 7, y - 10.5, label)
+        c.setFont(FONT, 7.5); c.drawString(x + 60, y - 10.5, ellipsize(text, FONT, 7.5, w - 66))
+        y -= 18
+    return y - 4
+
+
+def render_focus(md: str, out: Path) -> None:
+    """Meeting list + focus box + big notes on the left, checklists on the right."""
+    data = parse(md)
+    date = parse_date(data["title"]) or dt.date.today()
+    sections = data["sections"]
+    timed, allday = parse_meetings(sections.get("Meetings", []))
+    c = canvas.Canvas(str(out), pagesize=(PAGE_W, PAGE_H))
+    c.setTitle(f"Daily agenda {date.isoformat()}")
+    col_top = draw_header(c, date)
+    right = PAGE_W - MARGIN
+    bottom = MARGIN + 6
+    lx, lw = MARGIN, TIMELINE_W
+    sx = lx + lw + GUTTER
+    sw = right - sx
+    y = section_heading(c, lx, col_top, lw, "TODAY")
+    y = _meeting_rows(c, timed, allday, lx, y, lw)
+    y = section_heading(c, lx, y - 4, lw, "FOCUS")
+    for i in range(3):
+        c.setFillColor(GREY); c.setFont(FONT, 7); c.drawString(lx + 1, y - 10, f"{i + 1}.")
+        c.setStrokeColor(LIGHT); c.setLineWidth(0.5); c.line(lx + 12, y - 13, lx + lw, y - 13)
+        y -= 17
+    y = section_heading(c, lx, y - 8, lw, "NOTES")
+    lined_area(c, lx, bottom, lx + lw, y - 8)
+    draw_lists(c, sections, sx, col_top, sw, bottom)
+    c.setFillColor(LIGHT); c.setFont(FONT, 6)
+    c.drawRightString(right, MARGIN - 8, f"generated {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    c.showPage(); c.save()
+
+
+def render_compact(md: str, out: Path) -> None:
+    """Adaptive hour grid spanning only the working window, more notes room."""
+    data = parse(md)
+    date = parse_date(data["title"]) or dt.date.today()
+    sections = data["sections"]
+    timed, allday = parse_meetings(sections.get("Meetings", []))
+    c = canvas.Canvas(str(out), pagesize=(PAGE_W, PAGE_H))
+    c.setTitle(f"Daily agenda {date.isoformat()}")
+    col_top = draw_header(c, date)
+    right = PAGE_W - MARGIN
+    bottom = MARGIN + 6
+    lx, lw = MARGIN, TIMELINE_W
+    sx = lx + lw + GUTTER
+    sw = right - sx
+    start = min(8, int(min([m["start"] for m in timed], default=8)))
+    end = max(17, int(-(-max([m["end"] for m in timed], default=17) // 1)))
+    y = section_heading(c, lx, col_top, lw, "SCHEDULE")
+    if allday:
+        c.setFont(FONT, 7.5)
+        for a in allday[:3]:
+            y -= 10
+            c.setFillColor(FILL); c.roundRect(lx, y - 2.5, lw, 10, 2, stroke=0, fill=1)
+            c.setFillColor(INK); c.drawString(lx + 4, y, ellipsize("All day  ·  " + a, FONT, 7.5, lw - 8))
+        y -= 4
+    hours = end - start
+    hour_h = 24.0
+    grid_top = y - 4
+    grid_bottom = grid_top - hours * hour_h
+    label_w = 24
+    x0, x1 = lx + label_w, lx + lw
+    for i in range(hours + 1):
+        hy = grid_top - i * hour_h
+        c.setStrokeColor(LIGHT); c.setLineWidth(0.5); c.line(x0, hy, x1, hy)
+        if i < hours:
+            c.setStrokeColor(FAINT); c.setLineWidth(0.4); c.line(x0, hy - hour_h / 2, x1, hy - hour_h / 2)
+        c.setFillColor(GREY); c.setFont(FONT, 6.5); c.drawRightString(x0 - 4, hy - 2.2, f"{start + i:02d}")
+    def ypos(h):
+        h = min(max(h, start), end)
+        return grid_top - (h - start) * hour_h
+    lanes = []
+    for m in timed:
+        for li, lane in enumerate(lanes):
+            if all(m["start"] >= o["end"] or m["end"] <= o["start"] for o in lane):
+                lane.append(m); m["lane"] = li; break
+        else:
+            lanes.append([m]); m["lane"] = len(lanes) - 1
+    lane_w = (x1 - x0 - 2) / max(1, len(lanes))
+    for m in timed:
+        y1, y0 = ypos(m["start"]), ypos(m["end"])
+        if y1 - y0 < 10:
+            y0 = y1 - 10
+        bx = x0 + 1 + m["lane"] * lane_w
+        bw = lane_w - 2
+        c.setFillColor(FILL); c.setStrokeColor(INK); c.setLineWidth(0.7)
+        c.roundRect(bx, y0, bw, y1 - y0, 2.5, stroke=1, fill=1)
+        c.setFillColor(INK); c.rect(bx, y0, 2.2, y1 - y0, stroke=0, fill=1)
+        c.setFont(BOLD, 6.8)
+        if y1 - y0 < 18:
+            c.drawString(bx + 5, y1 - 8, ellipsize(m["label"] + "  " + m["text"], BOLD, 6.8, bw - 8))
+        else:
+            c.drawString(bx + 5, y1 - 8, m["label"])
+            c.setFont(FONT, 7)
+            lines = wrap(m["text"], FONT, 7, bw - 8)
+            max_lines = max(1, int((y1 - y0 - 12) / 8.5))
+            for i, ln in enumerate(lines[:max_lines]):
+                c.drawString(bx + 5, y1 - 17 - i * 8.5, ln)
+    y = section_heading(c, lx, grid_bottom - 16, lw, "NOTES")
+    lined_area(c, lx, bottom, lx + lw, y - 8)
+    draw_lists(c, sections, sx, col_top, sw, bottom)
+    c.setFillColor(LIGHT); c.setFont(FONT, 6)
+    c.drawRightString(right, MARGIN - 8, f"generated {dt.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    c.showPage(); c.save()
+
+
 def main() -> None:
-    if len(sys.argv) != 3:
+    if len(sys.argv) not in (3, 4):
         sys.exit(__doc__)
-    render(Path(sys.argv[1]).read_text(), Path(sys.argv[2]))
+    layout = sys.argv[3] if len(sys.argv) == 4 else os.environ.get("AGENDA_LAYOUT", "auto")
+    render(Path(sys.argv[1]).read_text(), Path(sys.argv[2]), layout)
 
 
 if __name__ == "__main__":
