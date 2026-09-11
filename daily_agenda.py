@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """Append one typed-text page per day to a reMarkable notebook via the cloud.
 
 Usage:
@@ -229,6 +230,9 @@ def new_pdf_bundle(name: str) -> tuple[str, dict, dict, dict[str, bytes]]:
 
 
 def append_pdf_page(doc_id: str, content: dict, files: dict[str, bytes], page_pdf: bytes) -> int:
+    # pypdf only needs 'cryptography' for encrypted PDFs; a broken system install
+    # of it (missing _cffi_backend) would crash the import, so hide it.
+    sys.modules.setdefault("cryptography", None)  # type: ignore[arg-type]
     from pypdf import PdfReader, PdfWriter  # type: ignore
     writer = PdfWriter()
     existing = files.get(f"{doc_id}.pdf")
