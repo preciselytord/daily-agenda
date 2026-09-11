@@ -1,4 +1,3 @@
-"""Append one agenda page per day to a reMarkable document via the cloud.
 """Append one typed-text page per day to a reMarkable notebook via the cloud.
 
 Usage:
